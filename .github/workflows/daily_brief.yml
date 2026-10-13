@@ -1,0 +1,117 @@
+name: DS Trade - Daily Brief Bot
+
+# O agendamento é feito pelo cron-job.org (9h Brasília, pontual), que chama este
+# workflow via workflow_dispatch com type=auto. O schedule nativo do GitHub foi
+# removido porque atrasava horas e causava POST DUPLICADO.
+#
+# type=auto  → ciclo com a rotina na nuvem (Claude escreve, este workflow publica).
+#              Se a rotina falhar, cai no Gemini e depois no template, avisa no
+#              grupo de testes e marca a execução como falha (o GitHub manda e-mail).
+# Ver docs/ROTINA_NUVEM.md.
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: 'Tipo de conteúdo'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - legacy_auto
+          - routine_test_daily
+          - routine_test_weekly
+          - daily_brief
+          - weekly_brief
+          - weekly_main
+          - all-samples
+          - check_quotes
+      dry_run:
+        description: 'Dry-run (só imprime, não envia ao Telegram) — vale só para legacy_auto, tipos avulsos e all-samples'
+        required: false
+        default: false
+        type: boolean
+
+# O ciclo da rotina grava no repo (input, posts/, usage/, data/) e apaga a branch
+# claude/* que consumiu.
+permissions:
+  contents: write
+
+# Nunca dois ciclos ao mesmo tempo (evita post duplicado se o cron disparar 2x).
+concurrency:
+  group: ds-trade-brief
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    # O ciclo da rotina espera até 20 min pelo texto do Claude (normalmente ~2 min).
+    timeout-minutes: 40
+
+    env:
+      TELEGRAM_BOT_TOKEN:     ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_BRIEF_CHAT_ID: ${{ secrets.TELEGRAM_BRIEF_CHAT_ID }}
+      TELEGRAM_MAIN_CHAT_ID:  ${{ secrets.TELEGRAM_MAIN_CHAT_ID }}
+      TELEGRAM_TEST_CHAT_ID:  ${{ secrets.TELEGRAM_TEST_CHAT_ID }}
+      GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+      FINNHUB_API_KEY:        ${{ secrets.FINNHUB_API_KEY }}
+      TELEGRAM_BRIEF_LINK:    ${{ secrets.TELEGRAM_BRIEF_LINK }}
+      TELEGRAM_MAIN_LINK:     ${{ secrets.TELEGRAM_MAIN_LINK }}
+      WHATSAPP_INVITE_LINK:   ${{ secrets.WHATSAPP_INVITE_LINK }}
+      TELEGRAPH_ACCESS_TOKEN: ${{ secrets.TELEGRAPH_ACCESS_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      # ── Ciclo com a rotina na nuvem (Claude escreve, Actions publica) ──────────
+      - name: Executar (auto → rotina na nuvem, canais oficiais)
+        if: github.event.inputs.type == 'auto'
+        run: python -m src.main --routine-auto
+
+      - name: Executar (rotina na nuvem → só grupo de testes)
+        if: startsWith(github.event.inputs.type, 'routine_test_')
+        run: |
+          case "${{ github.event.inputs.type }}" in
+            routine_test_daily)  T=daily_brief ;;
+            routine_test_weekly) T=weekly ;;
+          esac
+          python -m src.main --routine-test "$T"
+
+      # ── Caminho legado (Gemini + template de reserva), para rollback ───────────
+      - name: Executar (legacy_auto → Gemini)
+        if: github.event.inputs.type == 'legacy_auto'
+        run: |
+          FLAGS=""
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && FLAGS="--dry-run"
+          python -m src.main --auto $FLAGS
+
+      - name: Executar (manual → all-samples)
+        if: github.event.inputs.type == 'all-samples'
+        run: |
+          FLAGS=""
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && FLAGS="--dry-run"
+          python -m src.main --all-samples $FLAGS
+
+      - name: Executar (manual → tipo específico)
+        if: >
+          github.event.inputs.type != 'auto' &&
+          github.event.inputs.type != 'legacy_auto' &&
+          github.event.inputs.type != 'all-samples' &&
+          github.event.inputs.type != 'check_quotes' &&
+          !startsWith(github.event.inputs.type, 'routine_test_')
+        run: |
+          FLAGS=""
+          [ "${{ github.event.inputs.dry_run }}" = "true" ] && FLAGS="--dry-run"
+          python -m src.main --type ${{ github.event.inputs.type }} $FLAGS
+
+      # ── Diagnóstico: só busca as cotações e mostra o bloco (não envia nada) ────
+      - name: Checar cotações (Yahoo + Selic)
+        if: github.event.inputs.type == 'check_quotes'
+        run: python -m src.main --check-quotes
